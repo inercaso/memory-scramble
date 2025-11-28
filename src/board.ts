@@ -5,18 +5,14 @@
 import assert from 'node:assert';
 import fs from 'node:fs';
 
-/**
- * represents the state of a single card on the board
- */
+/** Represents the state of a single card on the board. */
 interface CardState {
-    value: string;
-    faceUp: boolean;
-    controller: string | null;
+    value: string;           // card's display string; non-empty, no whitespace
+    faceUp: boolean;         // true if visible to all players
+    controller: string | null; // playerId controlling this card, or null
 }
 
-/**
- * represents a player's current game state
- */
+/** Represents a player's current game state. */
 interface PlayerState {
     firstCard: { row: number; col: number } | null;
     secondCard: { row: number; col: number } | null;
@@ -24,30 +20,24 @@ interface PlayerState {
     previousMatched: boolean;
 }
 
-/**
- * deferred promise pattern for async waiting
- */
+/** Deferred promise pattern for async waiting. */
 interface Deferred<T> {
     promise: Promise<T>;
     resolve: (value: T) => void;
     reject: (reason: Error) => void;
 }
 
-/**
- * creates a new deferred promise
- * @returns deferred object with promise, resolve, and reject
- */
+/** @returns a new Deferred with an unresolved promise */
 function createDeferred<T>(): Deferred<T> {
     const { promise, resolve, reject } = Promise.withResolvers<T>();
     return { promise, resolve, reject };
 }
 
 /**
- * a mutable, concurrency-safe game board for memory scramble.
+ * A mutable, concurrency-safe game board for Memory Scramble.
  * 
- * the board consists of a grid of cards that players can flip over
- * to find matching pairs. players take turns flipping cards, and
- * matched pairs are removed from the board.
+ * Players can flip cards concurrently. When a player flips a card controlled
+ * by another player, they wait (without busy-waiting) until it becomes available.
  */
 export class Board {
 
@@ -58,36 +48,29 @@ export class Board {
     private readonly cardWaiters: Map<string, Array<Deferred<void>>>;
     private readonly changeWatchers: Array<Deferred<void>>;
 
-    // abstraction function:
+    // Abstraction Function:
     //   AF(rows, columns, cards, playerStates, cardWaiters, changeWatchers) =
-    //     a memory scramble board with dimensions rows x columns where:
-    //     - cards[r][c] represents the card at position (r, c), or null if removed
-    //     - each card has a value, face up/down state, and optional controller
-    //     - playerStates tracks each player's current cards and previous move
+    //     a Memory Scramble board with dimensions rows × columns where:
+    //     - cards[r][c] is the card at position (r, c), or null if removed
+    //     - playerStates tracks each player's current and previous cards
     //     - cardWaiters holds promises for players waiting to control cards
     //     - changeWatchers holds promises for players watching for changes
     //
-    // rep invariant:
+    // Rep Invariant:
     //   - rows > 0 && columns > 0
-    //   - cards.length === rows
-    //   - cards[i].length === columns for all 0 <= i < rows
-    //   - if a card is controlled, it must be face up
-    //   - each card is controlled by at most one player
-    //   - a player controls at most 2 cards (their first and second card)
-    //   - if player has secondCard, they must also have firstCard
+    //   - cards.length === rows && cards[i].length === columns for all i
+    //   - if card.controller !== null, then card.faceUp === true
+    //   - if player.secondCard !== null, then player.firstCard !== null
     //
-    // safety from rep exposure:
-    //   - all fields are private and readonly where applicable
-    //   - cards array contains mutable CardState objects but these are never exposed
-    //   - look() and toString() return new strings, not internal state
-    //   - playerStates map is not exposed; operations work on copies
+    // Safety from Rep Exposure:
+    //   - all fields are private and readonly
+    //   - no public method returns references to mutable internal objects
+    //   - look() and toString() return new strings
 
     /**
-     * create a new board with the given dimensions and cards.
-     * 
-     * @param rows number of rows, must be > 0
-     * @param columns number of columns, must be > 0
-     * @param cardValues array of card values in row-major order, length must be rows * columns
+     * @param rows number of rows, requires rows > 0
+     * @param columns number of columns, requires columns > 0
+     * @param cardValues card values in row-major order, requires length === rows * columns
      */
     private constructor(rows: number, columns: number, cardValues: Array<string>) {
         this.rows = rows;
@@ -114,6 +97,7 @@ export class Board {
         this.checkRep();
     }
 
+    /** Asserts the rep invariant. */
     private checkRep(): void {
         assert(this.rows > 0, 'rows must be positive');
         assert(this.columns > 0, 'columns must be positive');
@@ -123,16 +107,12 @@ export class Board {
             assert(this.cards[r]?.length === this.columns, `row ${r} length must match columns`);
             for (let c = 0; c < this.columns; c++) {
                 const card = this.cards[r]?.[c];
-                if (card !== null && card !== undefined) {
-                    // if controlled, must be face up
-                    if (card.controller !== null) {
-                        assert(card.faceUp, `controlled card at (${r},${c}) must be face up`);
-                    }
+                if (card !== null && card !== undefined && card.controller !== null) {
+                    assert(card.faceUp, `controlled card at (${r},${c}) must be face up`);
                 }
             }
         }
 
-        // check player states
         for (const [playerId, state] of this.playerStates) {
             if (state.secondCard !== null) {
                 assert(state.firstCard !== null, `player ${playerId} has second card but no first card`);
@@ -140,22 +120,17 @@ export class Board {
         }
     }
 
-    /**
-     * get the number of rows on the board.
-     * @returns number of rows
-     */
+    /** @returns number of rows (always > 0) */
     public getRows(): number {
         return this.rows;
     }
 
-    /**
-     * get the number of columns on the board.
-     * @returns number of columns
-     */
+    /** @returns number of columns (always > 0) */
     public getColumns(): number {
         return this.columns;
     }
 
+    /** @returns the PlayerState for playerId, creating one if needed */
     private getPlayerState(playerId: string): PlayerState {
         let state = this.playerStates.get(playerId);
         if (!state) {
@@ -170,10 +145,12 @@ export class Board {
         return state;
     }
 
+    /** @returns unique string key for board position (row, col) */
     private posKey(row: number, col: number): string {
         return `${row},${col}`;
     }
 
+    /** Resolves all pending watch() promises and clears the watchers list. */
     private notifyChangeWatchers(): void {
         const watchers = [...this.changeWatchers];
         this.changeWatchers.length = 0;
@@ -182,6 +159,7 @@ export class Board {
         }
     }
 
+    /** Resolves the first waiter for card at (row, col) in FIFO order. */
     private notifyCardWaiters(row: number, col: number): void {
         const key = this.posKey(row, col);
         const waiters = this.cardWaiters.get(key);
@@ -192,8 +170,7 @@ export class Board {
     }
 
     /**
-     * handles the start of a new first-card flip by processing previous move results.
-     * implements rules 3-A and 3-B.
+     * Handles cleanup from player's previous move (rules 3-A, 3-B).
      * @param playerId the player whose previous move to handle
      */
     private handlePreviousMove(playerId: string): void {
@@ -237,26 +214,24 @@ export class Board {
     }
 
     /**
-     * flip a card on the board following the gameplay rules.
+     * Flip a card on the board following gameplay rules 1-A through 2-E.
      * 
-     * @param playerId id of the player flipping
-     * @param row row of the card (0-indexed from top)
-     * @param column column of the card (0-indexed from left)
-     * @returns promise that resolves to the board state after flip
-     * @throws error if the flip fails per the rules
+     * @param playerId ID of player flipping, requires nonempty alphanumeric/underscore string
+     * @param row row of card, requires 0 <= row < rows
+     * @param column column of card, requires 0 <= column < columns
+     * @returns board state in BOARD_STATE format after the flip
+     * @throws Error "no card at this position" if space is empty (rules 1-A, 2-A)
+     * @throws Error "card is controlled by a player" if second card is controlled (rule 2-B)
      */
     public async flip(playerId: string, row: number, column: number): Promise<string> {
         const state = this.getPlayerState(playerId);
 
         if (state.firstCard === null) {
-            // flipping first card
             this.handlePreviousMove(playerId);
             await this.flipFirstCard(playerId, row, column);
         } else if (state.secondCard === null) {
-            // flipping second card
             this.flipSecondCard(playerId, row, column);
         } else {
-            // already has two cards, start new turn
             this.handlePreviousMove(playerId);
             state.firstCard = null;
             state.secondCard = null;
@@ -267,16 +242,19 @@ export class Board {
         return this.look(playerId);
     }
 
+    /**
+     * Flip first card (rules 1-A through 1-D).
+     * @throws Error if no card at position
+     */
     private async flipFirstCard(playerId: string, row: number, column: number): Promise<void> {
         const state = this.getPlayerState(playerId);
 
-        // rule 1-A: empty space
         let card = this.cards[row]?.[column];
         if (card === null || card === undefined) {
             throw new Error('no card at this position');
         }
 
-        // rule 1-D: card controlled by another player - wait
+        // rule 1-D: wait if controlled by another player
         while (card.controller !== null && card.controller !== playerId) {
             const key = this.posKey(row, column);
             let waiters = this.cardWaiters.get(key);
@@ -288,15 +266,13 @@ export class Board {
             waiters.push(deferred);
             await deferred.promise;
 
-            // after waiting, re-check card
             card = this.cards[row]?.[column];
             if (card === null || card === undefined) {
                 throw new Error('no card at this position');
             }
         }
 
-        // rule 1-B: face down - turn up and control
-        // rule 1-C: face up, not controlled - control it
+        // rules 1-B, 1-C: turn up and control
         if (!card.faceUp) {
             card.faceUp = true;
             this.notifyChangeWatchers();
@@ -305,6 +281,10 @@ export class Board {
         state.firstCard = { row, col: column };
     }
 
+    /**
+     * Flip second card (rules 2-A through 2-E).
+     * @throws Error if no card at position or card is controlled
+     */
     private flipSecondCard(playerId: string, row: number, column: number): void {
         const card = this.cards[row]?.[column];
         const state = this.getPlayerState(playerId);
@@ -322,13 +302,13 @@ export class Board {
             throw new Error('no card at this position');
         }
 
-        // rule 2-B: controlled by any player (including self)
+        // rule 2-B: controlled by any player
         if (card.controller !== null) {
             this.relinquishFirstCard(playerId);
             throw new Error('card is controlled by a player');
         }
 
-        // rule 2-C: turn face up if face down
+        // rule 2-C: turn face up
         if (!card.faceUp) {
             card.faceUp = true;
             this.notifyChangeWatchers();
@@ -336,14 +316,13 @@ export class Board {
 
         state.secondCard = { row, col: column };
 
-        // rule 2-D and 2-E: check for match
         if (firstCard && card.value === firstCard.value) {
-            // rule 2-D: match - keep control of both
+            // rule 2-D: match
             card.controller = playerId;
             state.previousCards = [firstPos, { row, col: column }];
             state.previousMatched = true;
         } else {
-            // rule 2-E: no match - relinquish control of both
+            // rule 2-E: no match
             if (firstCard) {
                 firstCard.controller = null;
                 this.notifyCardWaiters(firstPos.row, firstPos.col);
@@ -353,6 +332,7 @@ export class Board {
         }
     }
 
+    /** Relinquish control of player's first card when second flip fails. */
     private relinquishFirstCard(playerId: string): void {
         const state = this.getPlayerState(playerId);
         if (state.firstCard) {
@@ -369,10 +349,11 @@ export class Board {
     }
 
     /**
-     * look at the current state of the board from a player's perspective.
+     * Look at the current board state from a player's perspective.
      * 
-     * @param playerId id of the player looking
-     * @returns board state string in the format specified
+     * @param playerId ID of player looking, requires nonempty alphanumeric/underscore string
+     * @returns board state in BOARD_STATE format: "ROWxCOL\n" followed by one line per card
+     *          ("none", "down", "up VALUE", or "my VALUE")
      */
     public look(playerId: string): string {
         let result = `${this.rows}x${this.columns}\n`;
@@ -396,15 +377,13 @@ export class Board {
     }
 
     /**
-     * apply a transformation function to all cards on the board.
-     * maintains pairwise consistency: matching cards stay matching during the operation.
+     * Apply a transformation to all cards, maintaining pairwise consistency.
      * 
-     * @param playerId id of the player applying the map
-     * @param f async function to transform card values
-     * @returns board state after transformation
+     * @param playerId ID of player applying map, requires nonempty alphanumeric/underscore string
+     * @param f transformation function, requires f is a pure function (same input → same output)
+     * @returns board state in BOARD_STATE format after transformation
      */
     public async map(playerId: string, f: (card: string) => Promise<string>): Promise<string> {
-        // group cards by value to maintain pairwise consistency
         const valueGroups = new Map<string, Array<{ row: number; col: number }>>();
 
         for (let r = 0; r < this.rows; r++) {
@@ -421,7 +400,6 @@ export class Board {
             }
         }
 
-        // transform each group atomically
         for (const [oldValue, positions] of valueGroups) {
             const newValue = await f(oldValue);
             if (newValue !== oldValue) {
@@ -440,10 +418,10 @@ export class Board {
     }
 
     /**
-     * watch for changes to the board.
+     * Watch for board changes (card flip, removal, or value change via map).
      * 
-     * @param playerId id of the player watching
-     * @returns promise that resolves to board state when a change occurs
+     * @param playerId ID of player watching, requires nonempty alphanumeric/underscore string
+     * @returns board state in BOARD_STATE format when a change occurs
      */
     public async watch(playerId: string): Promise<string> {
         const deferred = createDeferred<void>();
@@ -453,7 +431,8 @@ export class Board {
     }
 
     /**
-     * @returns string representation of the board for debugging
+     * @returns human-readable board representation for debugging:
+     *          "[ ]" = removed, "[?]" = face down, "[VALUE]" = face up
      */
     public toString(): string {
         let result = `Board(${this.rows}x${this.columns}):\n`;
