@@ -11,6 +11,9 @@
 ## Table of Contents
 
 1. [Introduction](#1-introduction)
+   - 1.1 [Game Board Specification](#11-game-board-specification)
+   - 1.2 [Board File Format](#12-board-file-format)
+   - 1.3 [Board State Response Format](#13-board-state-response-format)
 2. [Objectives](#2-objectives)
 3. [Theoretical Background](#3-theoretical-background)
    - 3.1 [Abstract Data Types](#31-abstract-data-types)
@@ -29,6 +32,7 @@
    - 5.7 [Watch Mechanism for Change Notifications](#57-watch-mechanism-for-change-notifications)
    - 5.8 [Commands Module (Glue Code)](#58-commands-module-glue-code)
 6. [Testing Strategy](#6-testing-strategy)
+   - 6.0 [Test Framework](#60-test-framework)
    - 6.1 [Test Partitioning](#61-test-partitioning)
    - 6.2 [Concurrency Tests](#62-concurrency-tests)
 7. [Simulation Script](#7-simulation-script)
@@ -49,6 +53,89 @@ Key features include:
 - **Asynchronous waiting** - Players wait (without busy-waiting) when trying to flip cards controlled by others
 - **Real-time updates** - Watch mechanism allows clients to receive instant notifications of board changes
 - **Card transformation** - Map operation allows replacing cards while maintaining game consistency
+
+### 1.1 Game Board Specification
+
+The Memory Scramble game board consists of a grid of spaces. Each space starts with a card. As cards are matched and removed, spaces become empty.
+
+**Cards:** A card is a non-empty string of non-whitespace, non-newline characters. This allows text-based cards like `Hello` or emoji-based cards like `🌈`. Two cards match if they have the same string of characters.
+
+**Card States:** All cards start face down. Players turn them face up, and cards will either turn face down again (if non-matching) or be removed from the board (if matching).
+
+**Coordinate System:** Coordinates are specified as `(row, column)`, starting at `(0, 0)` in the top-left corner, increasing vertically downwards and horizontally to the right.
+
+### 1.2 Board File Format
+
+Game boards are loaded from files using the following grammar:
+
+```
+BOARD_FILE ::= ROW "x" COLUMN NEWLINE (CARD NEWLINE)+
+
+CARD    ::= [^\s\n\r]+
+ROW     ::= INT
+COLUMN  ::= INT
+INT     ::= [0-9]+
+NEWLINE ::= "\r"? "\n"
+```
+
+- `ROW` is the number of rows
+- `COLUMN` is the number of columns  
+- Cards are listed reading across each row, starting with the top row
+- A valid board file must have exactly `ROW × COLUMN` newline-terminated card lines
+
+**Example:** A 3×3 board of rainbows and unicorns:
+
+```
+3x3
+🦄
+🦄
+🌈
+🌈
+🌈
+🦄
+🌈
+🦄
+🌈
+```
+
+### 1.3 Board State Response Format
+
+The server responds with a board state showing the current state from the player's perspective:
+
+```
+BOARD_STATE ::= ROW "x" COLUMN NEWLINE (SPOT NEWLINE)+
+
+SPOT    ::= "none" | "down" | "up " CARD | "my " CARD
+CARD    ::= [^\s\n\r]+
+ROW     ::= INT
+COLUMN  ::= INT
+INT     ::= [0-9]+
+NEWLINE ::= "\r"? "\n"
+```
+
+| State | Meaning |
+|-------|---------|
+| `none` | No card at this location (removed) |
+| `down` | Face-down card |
+| `up <card>` | Face-up card controlled by another player or no one |
+| `my <card>` | Face-up card controlled by the requesting player |
+
+**Example Response:**
+
+```
+3x3
+up A
+down
+down
+none
+my B
+none
+down
+down
+up C
+```
+
+This indicates: cards at `(0,0)`, `(1,1)`, and `(2,2)` are face up; the player controls the `B` card at `(1,1)`; positions `(1,0)` and `(1,2)` have no cards.
 
 ---
 
@@ -588,6 +675,60 @@ This design ensures:
 ---
 
 ## 6. Testing Strategy
+
+### 6.0 Test Framework
+
+The project uses **Vitest** as its test framework. Vitest is a modern, fast testing framework that natively supports TypeScript without requiring a separate compilation step. Tests are written in TypeScript and executed directly from the `test/` directory.
+
+**Key benefits of Vitest:**
+- **Native TypeScript support** - No need to compile tests before running
+- **Fast execution** - Optimized for speed with parallel test execution
+- **Familiar API** - Uses the same `describe`, `it`, `expect` syntax as Jest/Mocha
+- **Verbose output** - Shows each test case with pass/fail status
+
+**Running Tests:**
+
+```bash
+# Run all tests with verbose output
+npm test
+
+# Run tests in watch mode (re-runs on file changes)
+npx vitest
+
+# Run tests with code coverage
+npm run coverage
+```
+
+**Example Output:**
+
+```
+ ✓ test/board.test.ts (28 tests)
+   ✓ Board (28 tests)
+     ✓ parseFromFile (3 tests)
+       ✓ parses a valid 3x3 board file
+       ✓ parses a valid 5x5 board file
+       ✓ throws on non-existent file
+     ✓ look (3 tests)
+       ✓ shows all cards face down initially
+       ✓ shows my card for controlled cards
+       ✓ shows up for cards controlled by others
+     ✓ flip first card (4 tests)
+       ✓ rule 1-A: empty space fails
+       ✓ rule 1-B: face down card turns up and player controls
+       ✓ rule 1-C: face up uncontrolled card becomes controlled
+       ✓ rule 1-D: waits for controlled card then takes control
+     ✓ flip second card (5 tests)
+       ✓ rule 2-A: empty space fails and relinquishes first
+       ✓ rule 2-B: controlled card fails and relinquishes first
+       ✓ rule 2-C: face down card turns face up
+       ✓ rule 2-D: matching cards keeps control of both
+       ✓ rule 2-E: non-matching cards relinquishes both
+     ...
+
+ Test Files  1 passed (1)
+      Tests  28 passed (28)
+   Duration  1.19s
+```
 
 ### 6.1 Test Partitioning
 
